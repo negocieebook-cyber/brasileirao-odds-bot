@@ -14,8 +14,8 @@ Uso:
     python brasileirao_bot.py --boas-vindas 123456 # boas-vindas p/ um novo destinatário
 
 Configuração (variáveis de ambiente ou arquivo .env ao lado do script):
-    BETBOT_TELEGRAM_TOKEN  token do bot (ou TELEGRAM_BOT_TOKEN)
-    BETBOT_CHAT_ID         ids separados por vírgula (ou TELEGRAM_HOME_CHANNEL)
+    BETBOT_TELEGRAM_TOKEN  token do bot
+    BETBOT_CHAT_ID         ids separados por vírgula
 
 Sem dependências externas — apenas biblioteca padrão do Python 3.9+.
 Fonte dos dados: https://bolsadeaposta.bet.br (API pública da exchange).
@@ -336,8 +336,8 @@ def main():
 
     carregar_env()
 
-    token = args.token or os.environ.get("BETBOT_TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-    chats_cfg = (os.environ.get("BETBOT_CHAT_ID") or os.environ.get("TELEGRAM_HOME_CHANNEL") or "")
+    token = args.token or os.environ.get("BETBOT_TELEGRAM_TOKEN")
+    chats_cfg = (os.environ.get("BETBOT_CHAT_ID") or "")
     destinatarios = [c.strip() for c in chats_cfg.split(",") if c.strip()]
     if not token or not destinatarios:
         print("[x] Token/destinatários não configurados (.env: BETBOT_TELEGRAM_TOKEN, BETBOT_CHAT_ID)")
