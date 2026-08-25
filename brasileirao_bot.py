@@ -8,12 +8,14 @@ Busca os jogos do Brasileirão Série A do dia na bolsa de apostas
 e envia um resumo formatado para o Telegram.
 
 Uso:
-    python brasileirao_bot.py            # mostra a mensagem (dry-run)
-    python brasileirao_bot.py --envio    # envia para o Telegram
+    python brasileirao_bot.py                      # mostra a mensagem (dry-run)
+    python brasileirao_bot.py --envio              # envia para todos os destinatários
+    python brasileirao_bot.py --boas-vindas        # boas-vindas p/ todos os destinatários
+    python brasileirao_bot.py --boas-vindas 123456 # boas-vindas p/ um novo destinatário
 
 Configuração (variáveis de ambiente ou arquivo .env ao lado do script):
     BETBOT_TELEGRAM_TOKEN  token do bot (ou TELEGRAM_BOT_TOKEN)
-    BETBOT_CHAT_ID         id do chat/destino (ou TELEGRAM_HOME_CHANNEL)
+    BETBOT_CHAT_ID         ids separados por vírgula (ou TELEGRAM_HOME_CHANNEL)
 
 Sem dependências externas — apenas biblioteca padrão do Python 3.9+.
 Fonte dos dados: https://bolsadeaposta.bet.br (API pública da exchange).
@@ -286,43 +288,39 @@ def montar_mensagem(jogos: list, agora_brt: datetime, proximo=None) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Telegram
+# Boas-vindas
 # ----------------------------------------------------------------------------
-LIMITE_MSG = 4000
-
-
-def dividir_mensagem(texto: str) -> list:
-    """Divide respeitando o limite do Telegram, cortando em blocos de jogo."""
-    if len(texto) <= LIMITE_MSG:
-        return [texto]
-    partes, atual = [], ""
-    for bloco in texto.split("\n\n"):
-        if len(atual) + len(bloco) + 2 > LIMITE_MSG and atual:
-            partes.append(atual)
-            atual = bloco
-        else:
-            atual = f"{atual}\n\n{bloco}" if atual else bloco
-    if atual:
-        partes.append(atual)
-    return partes
+def montar_boas_vindas(agora_brt: datetime) -> str:
+    return (
+        "👋 <b>Olá! Eu sou a Betina!</b> ⚽️\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Seja muito bem-vindo(a) à lista VIP do futebol brasileiro! 🇧🇷\n\n"
+        "📌 <b>O que eu faço?</b>\n"
+        "Todos os dias, 8:30 da manhã, eu te mando:\n"
+        "🏟 Os jogos do <b>Brasileirão Série A</b> do dia\n"
+        "🕐 Horário de cada partida (hora de Brasília)\n"
+        "📈 As odds da exchange (<b>Back</b> e <b>Lay</b>)\n"
+        "💰 O volume negociado em cada jogo\n\n"
+        "😴 Não tem jogo? Eu aviso e te conto quando vem o próximo!\n\n"
+        "💡 <i>Back = apostar a favor · Lay = apostar contra</i>\n"
+        "⚠️ Conteúdo informativo. Aposte com responsabilidade · +18\n\n"
+        "🤖 Me manda um oi quando quiser — agora é só aguardar o card de amanhã! 🍀"
+    )
 
 
 def enviar_telegram(token: str, chat_id: str, texto: str):
-    resultados = []
-    for parte in dividir_mensagem(texto):
-        payload = urllib.parse.urlencode({
-            "chat_id": chat_id,
-            "text": parte,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage", data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resultados.append(json.loads(resp.read().decode("utf-8")))
-    return resultados
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": texto,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 # ----------------------------------------------------------------------------
@@ -330,15 +328,51 @@ def enviar_telegram(token: str, chat_id: str, texto: str):
 # ----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Bot diário do Brasileirão Série A (odds da exchange)")
-    parser.add_argument("--envio", action="store_true", help="envia a mensagem para o Telegram")
-    parser.add_argument("--chat", help="chat_id destino (sobrepõe config)")
+    parser.add_argument("--envio", action="store_true", help="envia o card diário para os destinatários")
+    parser.add_argument("--boas-vindas", nargs="?", const="TODOS", default=None, metavar="CHAT_ID",
+                        help="envia mensagem de boas-vindas (todos os destinatários ou um CHAT_ID)")
     parser.add_argument("--token", help="token do bot (sobrepõe config)")
     args = parser.parse_args()
 
     carregar_env()
 
+    token = args.token or os.environ.get("BETBOT_TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+    chats_cfg = (os.environ.get("BETBOT_CHAT_ID") or os.environ.get("TELEGRAM_HOME_CHANNEL") or "")
+    destinatarios = [c.strip() for c in chats_cfg.split(",") if c.strip()]
+    if not token or not destinatarios:
+        print("[x] Token/destinatários não configurados (.env: BETBOT_TELEGRAM_TOKEN, BETBOT_CHAT_ID)")
+        sys.exit(1)
+
     agora_utc = datetime.now(timezone.utc)
     agora_brt = utc_to_brt(agora_utc)
+
+    # --- modo boas-vindas ---------------------------------------------------
+    if args.boas_vindas is not None:
+        alvos = destinatarios if args.boas_vindas == "TODOS" else [args.boas_vindas]
+        for alvo in alvos:
+            try:
+                enviar_telegram(token, alvo, montar_boas_vindas(agora_brt))
+                print(f"[✓] Boas-vindas enviada para {alvo}")
+            except Exception as e:
+                print(f"[x] Falha ao enviar para {alvo}: {e}")
+                sys.exit(1)
+        return
+
+    # --- card diário --------------------------------------------------------
+    if not args.envio:
+        import html as _html
+        print(f"[i] Destinatários: {', '.join(destinatarios)}")
+        print(f"[i] Coletando eventos… ({agora_brt:%d/%m/%Y %H:%M} Brasília)")
+        eventos = buscar_eventos()
+        serie_a = filtrar_serie_a(eventos)
+        jogos = jogos_do_dia(serie_a, agora_brt)
+        print(f"[i] {len(eventos)} eventos · {len(serie_a)} Série A · {len(jogos)} hoje")
+        mensagem = montar_mensagem(jogos, agora_brt, proximo_jogo(serie_a, agora_brt))
+        print("\n--- MENSAGEM (HTML) ---\n" + mensagem)
+        print("\n--- VISUALIZAÇÃO ---")
+        print(_html.unescape(mensagem).replace("<b>", "").replace("</b>", "")
+              .replace("<pre>", "").replace("</pre>", ""))
+        return
 
     print(f"[i] Coletando eventos… ({agora_brt:%d/%m/%Y %H:%M} Brasília)")
     eventos = buscar_eventos()
@@ -365,24 +399,21 @@ def main():
         json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    if not args.envio:
-        import html as _html
-        print("\n--- MENSAGEM (HTML) ---\n" + mensagem)
-        print("\n--- VISUALIZAÇÃO ---")
-        print(_html.unescape(mensagem).replace("<b>", "").replace("</b>", "")
-              .replace("<pre>", "").replace("</pre>", ""))
-        return
-
-    token = args.token or os.environ.get("BETBOT_TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat = args.chat or os.environ.get("BETBOT_CHAT_ID") or os.environ.get("TELEGRAM_HOME_CHANNEL")
-    if not token or not chat:
-        print("[x] Token/chat não configurados (.env: BETBOT_TELEGRAM_TOKEN, BETBOT_CHAT_ID)")
+    ok_todos = True
+    for chat in destinatarios:
+        try:
+            respostas = enviar_telegram(token, chat, mensagem)
+        except Exception as e:
+            ok_todos = False
+            print(f"[x] Falha ao enviar para {chat}: {e}")
+            continue
+        if isinstance(respostas, dict):
+            respostas = [respostas]
+        ok = all(r.get("ok") for r in respostas)
+        ok_todos = ok_todos and ok
+        print(f"[{'✓' if ok else 'x'}] Envio para {chat} {'ok' if ok else 'FALHOU'}")
+    if not ok_todos:
         sys.exit(1)
-
-    respostas = enviar_telegram(token, chat, mensagem)
-    ok = all(r.get("ok") for r in respostas)
-    print(f"[{'✓' if ok else 'x'}] Envio {'concluído' if ok else 'FALHOU'} "
-          f"({len(respostas)} mensagem(ns) para chat {chat})")
 
 
 if __name__ == "__main__":

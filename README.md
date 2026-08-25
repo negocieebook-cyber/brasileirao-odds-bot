@@ -53,18 +53,21 @@ Configure as credenciais criando um arquivo `.env` ao lado do script
 
 ```ini
 BETBOT_TELEGRAM_TOKEN=123456:ABC-SEU-TOKEN-DO-BOT
-BETBOT_CHAT_ID=-1001234567890
+BETBOT_CHAT_ID=201804194,405392024
 ```
 
 > 💡 Dica: crie o bot com o [@BotFather](https://t.me/BotFather).
 > Para descobrir o `chat_id`, mande uma mensagem pro bot e abra
 > `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+> ⚠️ Cada destinatário precisa mandar `/start` ao bot **antes** do primeiro envio.
 
 ## ▶️ Uso
 
 ```bash
-python brasileirao_bot.py            # dry-run: mostra a mensagem no terminal
-python brasileirao_bot.py --envio    # envia para o Telegram
+python brasileirao_bot.py                       # dry-run: mostra a mensagem no terminal
+python brasileirao_bot.py --envio               # envia o card para todos os destinatários
+python brasileirao_bot.py --boas-vindas         # boas-vindas para todos os destinatários
+python brasileirao_bot.py --boas-vindas 123456  # boas-vindas para um novo destinatário
 ```
 
 ## ⏰ Agendamento diário (8:30)
