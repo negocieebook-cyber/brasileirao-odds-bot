@@ -1,0 +1,13 @@
+# Segredos — NUNCA commitar
+.env
+*.env
+
+# Dados locais / logs
+data/
+*.log
+__pycache__/
+tmp/
+
+# Sistema
+.DS_Store
+Thumbs.db
