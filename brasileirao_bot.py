@@ -3,9 +3,13 @@
 """
 ⚽ Brasileirão Odds Bot
 ======================
-Busca os jogos do Brasileirão Série A do dia na bolsa de apostas
+Busca os jogos do dia de TIMES brasileiros na bolsa de apostas
 (Bolsa de Aposta / exchange) com as odds de Match Odds (1X2),
 e envia um resumo formatado para o Telegram.
+
+Cobre todas as competições domésticas (Brasileirão A/B/C/D, Copa do
+Brasil, estaduais) e jogos internacionais de clubes brasileiros
+(Libertadores, Sul-Americana).
 
 Uso:
     python brasileirao_bot.py                      # mostra a mensagem (dry-run)
@@ -33,7 +37,6 @@ from pathlib import Path
 # Configuração
 # ----------------------------------------------------------------------------
 API_URL = "https://mexchange-api.bolsadeaposta.bet.br/api/events"
-SERIE_A_URL_NAME = "brazil-serie-a"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -76,6 +79,71 @@ ALIASES = {
     "sport recife": "Sport",
     "juventude": "Juventude",
 }
+
+# Clubes brasileiros (normalizados: minúsculas, sem acentos) para casar jogos
+# internacionais (Libertadores, Sul-Americana, etc. — onde country != brazil).
+# Casa o nome do participante normalizado contra estas chaves.
+CLUBES_BR = {
+    "flamengo", "cr flamengo", "palmeiras", "se palmeiras", "corinthians",
+    "sport club corinthians paulista", "sc corinthians paulista", "sao paulo", "sao paulo fc",
+    "santos", "santos fc", "vasco da gama", "clube de regatas vasco da gama",
+    "botafogo", "botafogo fr", "ec juventude", "juventude", "sc internacional", "internacional",
+    "esporte clube bahia", "bahia", "mirassol", "mirassol fc", "atletico goianiense", "atletico go",
+    "gremio", "gremio fbpa", "red bull bragantino", "rb bragantino", "bragantino", "cuiaba",
+    "cuiaba ec", "fortaleza", "fortaleza ec", "ec vitoria", "vitoria",
+    "sport club recife", "sport recife", "sport", "athletico paranaense", "athletico-pr",
+    "cruzeiro", "fluminense", "atletico mineiro", "atletico-mg", "coritiba",
+    "chapecoense", "ceara", "ceara sc", "america mineiro", "america-mg", "goias",
+    "ponte preta", "operario", "novorizontino", "avai", "avai fc", "parana",
+    "sampaio correa", "paysandu",
+}
+
+def normalizar(texto: str) -> str:
+    """Minúsculas, sem acentos (ASCII)."""
+    from unicodedata import normalize as _norm
+    t = _norm("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return t.lower().strip()
+
+# Chaves de clube normalizadas (sem acento) para comparação
+_CLUBES_BR_NORM = {normalizar(c) for c in CLUBES_BR}
+
+def eh_time_brasileiro(nome: str) -> bool:
+    """True se o participante é um clube brasileiro conhecido (nome exato).
+
+    Casa pelo nome normalizado completo (ex.: 'santos fc', 'vasco da gama',
+    'palmeiras') para evitar colisão com times estrangeiros homônimos.
+    Variantes curtas/abreviadas estão no próprio CLUBES_BR.
+    """
+    n = normalizar(nome)
+    return n in _CLUBES_BR_NORM
+
+# Rótulo curto por competição (via url-name da meta-tag COMPETITION)
+COMPETICAO_LABEL = {
+    "brazil-serie-a": "Série A",
+    "brazil-serie-b": "Série B",
+    "brazil-serie-c": "Série C",
+    "brazil-serie-d": "Série D",
+    "brazil-cup": "Copa do Brasil",
+    "copa-do-brasil": "Copa do Brasil",
+    "brazil-nordeste-cup": "Copa do Nordeste",
+    "copa-nordeste": "Copa do Nordeste",
+    "libertadores": "Libertadores",
+    "conmebol-libertadores": "Libertadores",
+    "copa-libertadores": "Libertadores",
+    "sudamericana": "Sul-Americana",
+    "conmebol-sudamericana": "Sul-Americana",
+    "copa-sudamericana": "Sul-Americana",
+}
+
+def rotulo_competicao(evento: dict) -> str:
+    """Rótulo curto da competição do evento, ex: 'Série A', 'Copa do Brasil'."""
+    for tag in evento.get("meta-tags", []):
+        if tag.get("type") == "COMPETITION":
+            url = tag.get("url-name", "")
+            if url in COMPETICAO_LABEL:
+                return COMPETICAO_LABEL[url]
+            return url.replace("-", " ").title()
+    return "Futebol"
 
 
 def utc_to_brt(dt_utc: datetime) -> datetime:
@@ -142,14 +210,26 @@ def buscar_eventos() -> list:
     return eventos
 
 
-def filtrar_serie_a(eventos: list) -> list:
-    """Mantém apenas eventos cujo meta-tag de competição é Brazil Serie A."""
+def filtrar_times_brasileiros(eventos: list) -> list:
+    """Mantém eventos de futebol de times brasileiros.
+
+    Inclui:
+    - qualquer competição com country == brazil (Série A/B/C/D, Copa do Brasil,
+      Copa do Nordeste, estaduais etc.);
+    - jogos internacionais cujo algum participante é um clube brasileiro
+      reconhecido (Libertadores, Sul-Americana...).
+    """
     saida = []
     for ev in eventos:
-        for tag in ev.get("meta-tags", []):
-            if tag.get("type") == "COMPETITION" and tag.get("url-name") == SERIE_A_URL_NAME:
-                saida.append(ev)
-                break
+        # country == brazil cobre todas as competições domésticas
+        if any(t.get("type") == "COUNTRY" and t.get("url-name") == "brazil"
+               for t in ev.get("meta-tags", [])):
+            saida.append(ev)
+            continue
+        # internacionais: casa participantes com clubes brasileiros conhecidos
+        participantes = ev.get("event-participants", [])
+        if any(eh_time_brasileiro(p.get("participant-name", "")) for p in participantes):
+            saida.append(ev)
     return saida
 
 
@@ -241,13 +321,14 @@ def fmt_odd(odds) -> str:
 def montar_mensagem(jogos: list, agora_brt: datetime, proximo=None) -> str:
     data_hoje = agora_brt.strftime("%d/%m/%Y")
     titulo = (
-        f"⚽️ <b>BRASILEIRÃO SÉRIE A</b>\n"
+        f"⚽️ <b>JOGOS DE TIMES BRASILEIROS</b>\n"
         f"📅 {DIAS_SEMANA[agora_brt.weekday()]}, {data_hoje}\n"
+        f"🇧🇷 Todas as competições: Brasileirão, Copas, Libertadores, Sul-Americana\n"
         f"📈 Odds da exchange — Bolsa de Aposta\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     if not jogos:
-        partes = [titulo, "\n😴 <b>Nenhum jogo do Brasileirão hoje.</b>"]
+        partes = [titulo, "\n😴 <b>Nenhum jogo de time brasileiro hoje.</b>"]
         if proximo is not None:
             p_start = proximo["_start_brt"]
             quando = p_start.strftime("%d/%m (%a) às %H:%M").replace(
@@ -263,9 +344,10 @@ def montar_mensagem(jogos: list, agora_brt: datetime, proximo=None) -> str:
             m.get("live") for m in ev.get("markets", [])
         )
         selo = " 🔴 <b>AO VIVO</b>" if ao_vivo else ""
+        comp = rotulo_competicao(ev)
         cabecalho = (
             f"\n🏟 <b>{ev['name']}</b>{selo}\n"
-            f"🕐 {ev['_start_brt']:%H:%M} (Brasília) · 💰 {fmt_volume(ev.get('volume', 0))}"
+            f"🏆 {comp} · 🕐 {ev['_start_brt']:%H:%M} (Brasília) · 💰 {fmt_volume(ev.get('volume', 0))}"
         )
         linhas_odds = extrair_odds(ev)
         if linhas_odds:
@@ -297,7 +379,8 @@ def montar_boas_vindas(agora_brt: datetime) -> str:
         "Seja muito bem-vindo(a) à lista VIP do futebol brasileiro! 🇧🇷\n\n"
         "📌 <b>O que eu faço?</b>\n"
         "Todos os dias, 8:30 da manhã, eu te mando:\n"
-        "🏟 Os jogos do <b>Brasileirão Série A</b> do dia\n"
+        "🏟 Os jogos do futebol brasileiro do dia: Brasileirão (A/B/C/D),\n"
+        "   Copa do Brasil, estaduais, Libertadores e Sul-Americana\n"
         "🕐 Horário de cada partida (hora de Brasília)\n"
         "📈 As odds da exchange (<b>Back</b> e <b>Lay</b>)\n"
         "💰 O volume negociado em cada jogo\n\n"
@@ -327,7 +410,7 @@ def enviar_telegram(token: str, chat_id: str, texto: str):
 # Main
 # ----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Bot diário do Brasileirão Série A (odds da exchange)")
+    parser = argparse.ArgumentParser(description="Bot diário de jogos de times brasileiros (odds da exchange)")
     parser.add_argument("--envio", action="store_true", help="envia o card diário para os destinatários")
     parser.add_argument("--boas-vindas", nargs="?", const="TODOS", default=None, metavar="CHAT_ID",
                         help="envia mensagem de boas-vindas (todos os destinatários ou um CHAT_ID)")
@@ -364,10 +447,10 @@ def main():
         print(f"[i] Destinatários: {', '.join(destinatarios)}")
         print(f"[i] Coletando eventos… ({agora_brt:%d/%m/%Y %H:%M} Brasília)")
         eventos = buscar_eventos()
-        serie_a = filtrar_serie_a(eventos)
-        jogos = jogos_do_dia(serie_a, agora_brt)
-        print(f"[i] {len(eventos)} eventos · {len(serie_a)} Série A · {len(jogos)} hoje")
-        mensagem = montar_mensagem(jogos, agora_brt, proximo_jogo(serie_a, agora_brt))
+        br = filtrar_times_brasileiros(eventos)
+        jogos = jogos_do_dia(br, agora_brt)
+        print(f"[i] {len(eventos)} eventos · {len(br)} BR · {len(jogos)} hoje")
+        mensagem = montar_mensagem(jogos, agora_brt, proximo_jogo(br, agora_brt))
         print("\n--- MENSAGEM (HTML) ---\n" + mensagem)
         print("\n--- VISUALIZAÇÃO ---")
         print(_html.unescape(mensagem).replace("<b>", "").replace("</b>", "")
@@ -376,11 +459,11 @@ def main():
 
     print(f"[i] Coletando eventos… ({agora_brt:%d/%m/%Y %H:%M} Brasília)")
     eventos = buscar_eventos()
-    serie_a = filtrar_serie_a(eventos)
-    jogos = jogos_do_dia(serie_a, agora_brt)
-    print(f"[i] {len(eventos)} eventos · {len(serie_a)} Série A · {len(jogos)} hoje")
+    br = filtrar_times_brasileiros(eventos)
+    jogos = jogos_do_dia(br, agora_brt)
+    print(f"[i] {len(eventos)} eventos · {len(br)} BR · {len(jogos)} hoje")
 
-    mensagem = montar_mensagem(jogos, agora_brt, proximo_jogo(serie_a, agora_brt))
+    mensagem = montar_mensagem(jogos, agora_brt, proximo_jogo(br, agora_brt))
 
     DATA_DIR.mkdir(exist_ok=True)
     snapshot = {
