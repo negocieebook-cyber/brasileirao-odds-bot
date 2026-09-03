@@ -186,7 +186,12 @@ def http_get_json(url: str, timeout: int = 30):
 # Coleta
 # ----------------------------------------------------------------------------
 def buscar_eventos() -> list:
-    """Busca eventos de futebol abertos (paginação simples)."""
+    """Busca eventos de futebol abertos (paginação simples).
+
+    A API reporta `total` truncado (=100 por página) mesmo quando existe
+    mais de uma página, então NÃO se deve parar por `offset >= total`.
+    Para só quando uma página vier vazia (fim real do feed).
+    """
     eventos, offset, pagina = [], 0, 0
     while pagina < MAX_PAGES:
         params = urllib.parse.urlencode({
@@ -202,11 +207,10 @@ def buscar_eventos() -> list:
         dados = http_get_json(f"{API_URL}?{params}")
         lote = dados.get("events", [])
         eventos.extend(lote)
-        total = int(dados.get("total", len(eventos)))
         offset += PER_PAGE
         pagina += 1
-        if not lote or offset >= total:
-            break
+        if not lote or len(lote) < PER_PAGE:
+            break  # página incompleta = fim do feed
     return eventos
 
 
