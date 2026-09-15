@@ -26,6 +26,7 @@ Fonte dos dados: https://bolsadeaposta.bet.br (API pública da exchange).
 """
 import argparse
 import json
+import math
 import os
 import sys
 import urllib.parse
@@ -33,10 +34,14 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import quant_model as qm  # núcleo quant N3 (Poisson Dixon-Coles, EV, Kelly, AIF)
+
 # ----------------------------------------------------------------------------
 # Configuração
 # ----------------------------------------------------------------------------
 API_URL = "https://mexchange-api.bolsadeaposta.bet.br/api/events"
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard?dates={date}"
+ESPN_SCHEDULE_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/teams/{team_id}/schedule?dates={season}"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -182,6 +187,25 @@ def http_get_json(url: str, timeout: int = 30):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def http_get_espn_json(url: str, timeout: int = 30):
+    """A API pública ESPN rejeita o user-agent do site da exchange em alguns endpoints."""
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def nomes_compativeis(a: str, b: str) -> bool:
+    """Match conservador para provedores: nome completo ou alias conhecido."""
+    aliases = {
+        "atletica ponte preta": "ponte preta", "operario ferroviario": "operario pr",
+        "clube nautico capibaribe": "nautico", "sport club do recife": "sport",
+        "sc internacional": "internacional", "ec vitoria": "vitoria",
+        "red bull bragantino": "red bull bragantino", "clube do remo": "remo",
+    }
+    na, nb = normalizar(a), normalizar(b)
+    return aliases.get(na, na) == aliases.get(nb, nb)
+
+
 # ----------------------------------------------------------------------------
 # Coleta
 # ----------------------------------------------------------------------------
@@ -246,6 +270,20 @@ def jogos_do_dia(eventos: list, agora_brt: datetime) -> list:
         start_utc = datetime.fromisoformat(ev["start"].replace("Z", "+00:00"))
         start_brt = utc_to_brt(start_utc)
         if inicio <= start_brt < fim:
+            ev["_start_brt"] = start_brt
+            jogos.append(ev)
+    jogos.sort(key=lambda e: e["_start_brt"])
+    return jogos
+
+
+def jogos_da_semana(eventos: list, agora_brt: datetime) -> list:
+    """Mantém jogos entre agora e os próximos sete dias, em horário de Brasília."""
+    fim = agora_brt + timedelta(days=7)
+    jogos = []
+    for ev in eventos:
+        start_utc = datetime.fromisoformat(ev["start"].replace("Z", "+00:00"))
+        start_brt = utc_to_brt(start_utc)
+        if agora_brt <= start_brt < fim:
             ev["_start_brt"] = start_brt
             jogos.append(ev)
     jogos.sort(key=lambda e: e["_start_brt"])
@@ -319,58 +357,357 @@ def fmt_odd(odds) -> str:
     return f"{odds:.2f}" if isinstance(odds, (int, float)) else "—"
 
 
+# -----------------------------------------------------------------------------
+# Recomendações: fail-closed. Este bot só divulga uma posição quando a entrada
+# do modelo já foi validada e a odd atual foi observada na exchange.
+# -----------------------------------------------------------------------------
+MIN_EV = 0.05
+KELLY_FRACTION = 0.25
+MAX_STAKE_PCT = 2.0
+
+
+def calcular_stake_pct(probabilidade: float, odds: float) -> float:
+    """Kelly fracionado (1/4), com teto de 2% da banca por posição."""
+    if not isinstance(probabilidade, (int, float)) or not isinstance(odds, (int, float)):
+        return 0.0
+    if not 0 < probabilidade < 1 or odds <= 1:
+        return 0.0
+    kelly = (probabilidade * odds - 1) / (odds - 1)
+    return round(max(0.0, min(MAX_STAKE_PCT, kelly * KELLY_FRACTION * 100)), 2)
+
+
+def estimar_1x2_poisson(lambda_home: float, lambda_away: float, max_gols: int = 10) -> dict:
+    """Probabilidades 1X2 por distribuição de Poisson truncada e normalizada."""
+    if lambda_home <= 0 or lambda_away <= 0:
+        raise ValueError("lambdas devem ser positivos")
+    home = draw = away = 0.0
+    for gols_casa in range(max_gols + 1):
+        p_casa = math.exp(-lambda_home) * lambda_home ** gols_casa / math.factorial(gols_casa)
+        for gols_fora in range(max_gols + 1):
+            p_fora = math.exp(-lambda_away) * lambda_away ** gols_fora / math.factorial(gols_fora)
+            p = p_casa * p_fora
+            if gols_casa > gols_fora:
+                home += p
+            elif gols_casa == gols_fora:
+                draw += p
+            else:
+                away += p
+    total = home + draw + away
+    return {"home": home / total, "draw": draw / total, "away": away / total}
+
+
+def calcular_recomendacao_modelo(selection: str, odds: float, probability: float,
+                                 match: str, source: str) -> dict | None:
+    """Cria recomendação somente quando o modelo supera o limiar de EV."""
+    ev = probability * odds - 1
+    stake = calcular_stake_pct(probability, odds)
+    if ev < MIN_EV or stake <= 0:
+        return None
+    return {
+        "match": match,
+        "selection": selection,
+        "odds": odds,
+        "model_probability": probability,
+        "ev": ev,
+        "stake_pct": stake,
+        "price_verified": True,
+        "data_status": "verified",
+        "source": source,
+    }
+
+
+def _placar_evento_espn(evento: dict, team_id: str):
+    """(gols pró, gols contra, homeAway) de um jogo encerrado da ESPN."""
+    comp = evento.get("competitions", [{}])[0]
+    if comp.get("status", {}).get("type", {}).get("name") != "STATUS_FULL_TIME":
+        return None
+    cs = comp.get("competitors", [])
+    alvo = next((c for c in cs if str(c.get("team", {}).get("id")) == str(team_id)), None)
+    rival = next((c for c in cs if c is not alvo), None)
+    if not alvo or not rival:
+        return None
+    try:
+        return float(alvo["score"]["value"]), float(rival["score"]["value"]), alvo["homeAway"]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _taxas_time_espn(league: str, team_id: str, season: int):
+    dados = http_get_espn_json(ESPN_SCHEDULE_URL.format(league=league, team_id=team_id, season=season))
+    mandante, visitante = [], []
+    for evento in dados.get("events", []):
+        placar = _placar_evento_espn(evento, team_id)
+        if not placar:
+            continue
+        gf, ga, lado = placar
+        (mandante if lado == "home" else visitante).append((gf, ga))
+    def media(jogos, idx):
+        return sum(j[idx] for j in jogos) / len(jogos) if jogos else None
+    return {
+        "home_gf": media(mandante, 0), "home_ga": media(mandante, 1), "home_n": len(mandante),
+        "away_gf": media(visitante, 0), "away_ga": media(visitante, 1), "away_n": len(visitante),
+    }
+
+
+# Constante de shrnkage (empirical-Bayes clássico): quantos jogos "fantasma" de
+# média da competição contam a favor da média do time. Amostra curta -> a média
+# puxa forte para o baseline da liga; amostra grande -> prevalece a média real.
+SHRINKAGE_K = 30
+BASELINE_GOL_LIGA = {
+    # média de gols por time por jogo (atacar) + média sofrida, por divisão.
+    # Valores [não verificados oficialmente] — calibração inicial conservadora
+    # para a liga; substituível por médias reais da ESPN quando coletadas.
+    "bra.1": 1.45, "bra.2": 1.30, "bra.3": 1.20, "bra.4": 1.15,
+}
+
+
+def _com_shrinkage(media_time: float, n: int, baseline: float, k: float = SHRINKAGE_K) -> float | None:
+    """Média do time encolhida (empirical Bayes): tempo real + k jogos de baseline.
+
+    n = número de jogos reais observados. Se n == 0 -> baseline (não assume nada
+    do time). Reduz o extremo de azarões de odds longas em amostras curtas.
+    """
+    if media_time is None:
+        return baseline
+    if n <= 0:
+        return baseline
+    return (media_time * n + baseline * k) / (n + k)
+
+
+def _taxas_com_shrinkage(league: str, team_id: str, season: int) -> dict | None:
+    """Taxas de gols do time com shrinkage em direção à média da divisão.
+
+    Fail-closed: exige min. 8 jogos reais; senão retorna None (não assume time).
+    """
+    raw = _taxas_time_espn(league, team_id, season)
+    if min(raw["home_n"], raw["away_n"]) < 8:
+        return None
+    base = BASELINE_GOL_LIGA.get(league, 1.30)
+    return {
+        "home_gf": _com_shrinkage(raw["home_gf"], raw["home_n"], base),
+        "home_ga": _com_shrinkage(raw["home_ga"], raw["home_n"], base),
+        "away_gf": _com_shrinkage(raw["away_gf"], raw["away_n"], base),
+        "away_ga": _com_shrinkage(raw["away_ga"], raw["away_n"], base),
+    }
+
+
+def _espn_partida_por_nomes(league: str, date: str, casa: str, fora: str):
+    dados = http_get_espn_json(ESPN_SCOREBOARD_URL.format(league=league, date=date))
+    for evento in dados.get("events", []):
+        cs = evento.get("competitions", [{}])[0].get("competitors", [])
+        home = next((c for c in cs if c.get("homeAway") == "home"), None)
+        away = next((c for c in cs if c.get("homeAway") == "away"), None)
+        if home and away and nomes_compativeis(home["team"]["displayName"], casa) and nomes_compativeis(away["team"]["displayName"], fora):
+            return home, away
+    return None
+
+
+def gerar_recomendacoes_espn(jogos: list, agora_brt: datetime) -> list:
+    """Modelo Poisson inicial para Série B, baseado no histórico 2026 da ESPN.
+
+    Sem xG, escalações ou lesões: o escopo é limitado e qualquer falha exclui
+    a partida, nunca cria uma indicação estimada.
+    """
+    recomendacoes = []
+    league = "bra.2"
+    date = agora_brt.strftime("%Y%m%d")
+    for ev in jogos:
+        if rotulo_competicao(ev) != "Série B":
+            continue
+        participantes = [p.get("participant-name", "") for p in ev.get("event-participants", [])]
+        if len(participantes) != 2:
+            continue
+        casa, fora = participantes
+        try:
+            partida = _espn_partida_por_nomes(league, date, casa, fora)
+            if not partida:
+                continue
+            home, away = partida
+            th = _taxas_time_espn(league, home["team"]["id"], agora_brt.year)
+            ta = _taxas_time_espn(league, away["team"]["id"], agora_brt.year)
+            if min(th["home_n"], ta["away_n"]) < 8:
+                continue
+            lambda_home = (th["home_gf"] + ta["away_ga"]) / 2
+            lambda_away = (ta["away_gf"] + th["home_ga"]) / 2
+            probs = estimar_1x2_poisson(lambda_home, lambda_away)
+            odds = extrair_odds(ev) or []
+            for nome, back, _ in odds:
+                if not back:
+                    continue
+                chave = "draw" if normalizar(nome) in ("draw", "empate") else (
+                    "home" if nomes_compativeis(nome, casa) else "away" if nomes_compativeis(nome, fora) else None
+                )
+                if chave:
+                    rec = calcular_recomendacao_modelo(
+                        f"{ev['name']} — {nome}", back, probs[chave], ev["name"],
+                        "Resultados 2026 ESPN + Poisson (Série B)",
+                    )
+                    if rec:
+                        recomendacoes.append(rec)
+        except Exception as exc:
+            print(f"[!] Modelo ESPN ignorou {ev.get('name')}: {exc}")
+    return recomendacoes_verificadas(recomendacoes)
+
+
+# Liga ESPN para cada competição brasileira (Brasileirão A/B/C/D). Competições
+# sem histórico ESPN coberto ficam de fora (fail-closed): melhor não recomendar
+# do que recomendar com dados ausentes.
+COMPETICAO_ESPN_LEAGUE = {
+    "Série A": "bra.1",
+    "Série B": "bra.2",
+    "Série C": "bra.3",
+    "Série D": "bra.4",
+}
+
+
+def gerar_recomendacoes_espn_n3(jogos: list, agora_brt: datetime) -> list:
+    """Modelo quant N3: Poisson Dixon-Coles nas 4 divisões BR (feedback ESPN).
+
+    Fail-closed: só recomenda quando o histórico da ESPN tem amostra mínima,
+    o jogo foi encontrado no scoreboard e a odd Back foi observada na exchange.
+    Agent 1 (AIF) e Agent 2 (tático) permanecem avaliados mas — sem fonte de
+    xG/escalação na ESPN — não alteram a probabilidade: qualquer desvio de
+    contexto seria fabricação, e aqui fabricação não entra.
+    """
+    recomendacoes = []
+    date = agora_brt.strftime("%Y%m%d")
+    for ev in jogos:
+        comp = rotulo_competicao(ev)
+        league = COMPETICAO_ESPN_LEAGUE.get(comp)
+        if not league:
+            continue  # sem histórico ESPN -> NO BET
+        participantes = [p.get("participant-name", "") for p in ev.get("event-participants", [])]
+        if len(participantes) != 2:
+            continue
+        casa, fora = participantes
+        try:
+            partida = _espn_partida_por_nomes(league, date, casa, fora)
+            if not partida:
+                continue
+            home, away = partida
+            th = _taxas_com_shrinkage(league, home["team"]["id"], agora_brt.year)
+            ta = _taxas_com_shrinkage(league, away["team"]["id"], agora_brt.year)
+            if th is None or ta is None:
+                continue
+            lambda_home = (th["home_gf"] + ta["away_ga"]) / 2
+            lambda_away = (ta["away_gf"] + th["home_ga"]) / 2
+            merc = qm.estimar_mercados(lambda_home, lambda_away, rho=0.08)
+            odds = extrair_odds(ev) or []
+            for nome, back, _ in odds:
+                if not back:
+                    continue
+                chave = "draw" if normalizar(nome) in ("draw", "empate") else (
+                    "home" if nomes_compativeis(nome, casa) else "away" if nomes_compativeis(nome, fora) else None
+                )
+                if chave and chave in ("home", "draw", "away"):
+                    rec = qm.montar_recomendacao(
+                        odds=back,
+                        probabilidade=merc[chave],
+                        match=ev["name"],
+                        selection=f"{ev['name']} — {nome}",
+                        source=f"ESPN {comp} 2026 + Dixon-Coles",
+                        commission=float(os.environ.get("BETBOT_COMMISSION", "0") or 0),
+                    )
+                    if rec:
+                        rec["source"] = f"{rec['source']} (1X2)"
+                        recomendacoes.append(rec)
+        except Exception as exc:
+            print(f"[!] Modelo N3 ignorou {ev.get('name')}: {exc}")
+    return recomendacoes_verificadas(recomendacoes)
+
+
+def recomendacoes_verificadas(recomendacoes: list) -> list:
+    """Retorna somente recomendações auditáveis e com EV >= 5%."""
+    saida = []
+    for rec in recomendacoes or []:
+        odds = rec.get("odds")
+        prob = rec.get("model_probability")
+        if not (rec.get("price_verified") and rec.get("data_status") == "verified"):
+            continue
+        if not isinstance(odds, (int, float)) or not isinstance(prob, (int, float)):
+            continue
+        ev = prob * odds - 1
+        stake = calcular_stake_pct(prob, odds)
+        if ev < MIN_EV or stake <= 0:
+            continue
+        item = dict(rec)
+        item["ev"] = ev
+        item["stake_pct"] = stake
+        saida.append(item)
+    return sorted(saida, key=lambda x: (x["ev"], x["stake_pct"]), reverse=True)
+
+
+def carregar_recomendacoes() -> list:
+    """Lê entradas de modelo previamente verificadas; ausência significa NO BET."""
+    arquivo = DATA_DIR / "model_recommendations.json"
+    if not arquivo.exists():
+        return []
+    try:
+        dados = json.loads(arquivo.read_text(encoding="utf-8"))
+        return dados if isinstance(dados, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def bloco_melhores_apostas(recomendacoes: list) -> str:
+    linhas = ["🎯 <b>MELHORES APOSTAS</b>"]
+    if not recomendacoes:
+        linhas.append("Nenhuma aposta VERIFICADA | 0% da banca")
+        linhas.append("<i>Sem modelo independente calibrado e dados verificados, a decisão é NO BET.</i>")
+        return "\n".join(linhas)
+    for rec in recomendacoes[:5]:
+        linhas.append(f"{rec.get('selection', 'Seleção')} @ {fmt_odd(rec['odds'])} | {rec['stake_pct']:.2f}% da banca")
+    return "\n".join(linhas)
+
+
+def bloco_jogos(titulo: str, jogos: list) -> str:
+    linhas = [f"🏟 <b>{titulo}</b>"]
+    if not jogos:
+        linhas.append("Nenhum jogo encontrado no período.")
+        return "\n".join(linhas)
+    for ev in jogos:
+        odds = extrair_odds(ev) or []
+        odds_txt = " · ".join(
+            f"{('Empate' if nome.strip().lower() in ('draw', 'empate') else encurtar(nome))} {fmt_odd(back)}"
+            for nome, back, _ in odds
+        ) or "mercado 1X2 indisponível"
+        linhas.extend([
+            f"\n<b>{ev['name']}</b> · {rotulo_competicao(ev)} · {ev['_start_brt']:%d/%m %H:%M}",
+            f"ODDS: {odds_txt}",
+            "INFORMAÇÕES / DESFALQUES: <i>não verificados</i>",
+        ])
+    return "\n".join(linhas)
+
+
 # ----------------------------------------------------------------------------
 # Mensagem
 # ----------------------------------------------------------------------------
-def montar_mensagem(jogos: list, agora_brt: datetime, proximo=None) -> str:
+def montar_mensagem(jogos: list, agora_brt: datetime, proximo=None, weekly_games=None,
+                    recomendacoes=None) -> str:
+    """Monta o boletim em três blocos; recomendação sem evidência é sempre NO BET."""
     data_hoje = agora_brt.strftime("%d/%m/%Y")
     titulo = (
-        f"⚽️ <b>JOGOS DE TIMES BRASILEIROS</b>\n"
+        f"⚽️ <b>BETINA | FUTEBOL BRASILEIRO</b>\n"
         f"📅 {DIAS_SEMANA[agora_brt.weekday()]}, {data_hoje}\n"
-        f"🇧🇷 Todas as competições: Brasileirão, Copas, Libertadores, Sul-Americana\n"
-        f"📈 Odds da exchange — Bolsa de Aposta\n"
+        f"📈 Odds Back da exchange — Bolsa de Aposta\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
-    if not jogos:
-        partes = [titulo, "\n😴 <b>Nenhum jogo de time brasileiro hoje.</b>"]
-        if proximo is not None:
-            p_start = proximo["_start_brt"]
-            quando = p_start.strftime("%d/%m (%a) às %H:%M").replace(
-                p_start.strftime("%a"), DIAS_SEMANA[p_start.weekday()]
-            )
-            partes.append(f"\n⏭ Próximo: <b>{proximo['name']}</b>\n🗓 {quando} (Brasília)")
-        partes.append(f"\n🤖 Gerado às {agora_brt:%H:%M} · bolsadeaposta.bet.br")
-        return "\n".join(partes)
+    if weekly_games is None:
+        weekly_games = jogos
+    if recomendacoes is None:
+        recomendacoes = recomendacoes_verificadas(carregar_recomendacoes())
 
-    blocos = []
-    for ev in jogos:
-        ao_vivo = bool(ev.get("in-running-flag")) or any(
-            m.get("live") for m in ev.get("markets", [])
-        )
-        selo = " 🔴 <b>AO VIVO</b>" if ao_vivo else ""
-        comp = rotulo_competicao(ev)
-        cabecalho = (
-            f"\n🏟 <b>{ev['name']}</b>{selo}\n"
-            f"🏆 {comp} · 🕐 {ev['_start_brt']:%H:%M} (Brasília) · 💰 {fmt_volume(ev.get('volume', 0))}"
-        )
-        linhas_odds = extrair_odds(ev)
-        if linhas_odds:
-            tabela = ["<pre>", f"{'':15s} Back    Lay"]
-            for nome, back, lay in linhas_odds:
-                rotulo = "Empate" if nome.strip().lower() in ("draw", "empate") else encurtar(nome)
-                tabela.append(f"{rotulo:15s} {fmt_odd(back):6s} {fmt_odd(lay)}")
-            tabela.append("</pre>")
-            bloco = cabecalho + "\n" + "\n".join(tabela)
-        else:
-            bloco = cabecalho
-        blocos.append(bloco)
-
-    rodape = (
-        f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 Back = apostar a favor · Lay = contra\n"
-        f"🤖 Gerado às {agora_brt:%H:%M} · fonte: bolsadeaposta.bet.br"
+    partes = [titulo, bloco_melhores_apostas(recomendacoes), bloco_jogos("JOGOS DO DIA", jogos)]
+    jogos_semana_futuros = [ev for ev in weekly_games if ev["_start_brt"].date() != agora_brt.date()]
+    partes.append(bloco_jogos("JOGOS DA SEMANA", jogos_semana_futuros))
+    if not jogos and proximo is not None:
+        partes.append(f"⏭ Próximo jogo: <b>{proximo['name']}</b> · {proximo['_start_brt']:%d/%m %H:%M}")
+    partes.append(
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ Odds e informações podem mudar. Conteúdo informativo +18.\n"
+        f"🤖 Gerado às {agora_brt:%H:%M} · fonte de odds: bolsadeaposta.bet.br"
     )
-    return titulo + "\n" + "\n".join(blocos) + "\n" + rodape
+    return "\n\n".join(partes)
 
 
 # ----------------------------------------------------------------------------
@@ -395,19 +732,40 @@ def montar_boas_vindas(agora_brt: datetime) -> str:
     )
 
 
+def dividir_mensagem(texto: str, limite: int = 4096) -> list:
+    """Divide texto longo sem perder caracteres; prefere cortes após quebra de linha."""
+    if len(texto) <= limite:
+        return [texto]
+    partes = []
+    restante = texto
+    while len(restante) > limite:
+        corte = restante.rfind("\n", 0, limite + 1)
+        if corte < 1:
+            corte = limite
+        else:
+            corte += 1  # preserva a quebra de linha na parte anterior
+        partes.append(restante[:corte])
+        restante = restante[corte:]
+    partes.append(restante)
+    return partes
+
+
 def enviar_telegram(token: str, chat_id: str, texto: str):
-    payload = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": texto,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage", data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    respostas = []
+    for parte in dividir_mensagem(texto):
+        payload = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": parte,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            respostas.append(json.loads(resp.read().decode("utf-8")))
+    return respostas
 
 
 # ----------------------------------------------------------------------------
@@ -453,8 +811,14 @@ def main():
         eventos = buscar_eventos()
         br = filtrar_times_brasileiros(eventos)
         jogos = jogos_do_dia(br, agora_brt)
-        print(f"[i] {len(eventos)} eventos · {len(br)} BR · {len(jogos)} hoje")
-        mensagem = montar_mensagem(jogos, agora_brt, proximo_jogo(br, agora_brt))
+        semana = jogos_da_semana(br, agora_brt)
+        recomendacoes = gerar_recomendacoes_espn_n3(jogos, agora_brt) + recomendacoes_verificadas(carregar_recomendacoes())
+        recomendacoes = recomendacoes_verificadas(recomendacoes)
+        print(f"[i] {len(eventos)} eventos · {len(br)} BR · {len(jogos)} hoje · {len(semana)} na semana · {len(recomendacoes)} value")
+        mensagem = montar_mensagem(
+            jogos, agora_brt, proximo_jogo(br, agora_brt), weekly_games=semana,
+            recomendacoes=recomendacoes,
+        )
         print("\n--- MENSAGEM (HTML) ---\n" + mensagem)
         print("\n--- VISUALIZAÇÃO ---")
         print(_html.unescape(mensagem).replace("<b>", "").replace("</b>", "")
@@ -465,9 +829,15 @@ def main():
     eventos = buscar_eventos()
     br = filtrar_times_brasileiros(eventos)
     jogos = jogos_do_dia(br, agora_brt)
-    print(f"[i] {len(eventos)} eventos · {len(br)} BR · {len(jogos)} hoje")
+    semana = jogos_da_semana(br, agora_brt)
+    recomendacoes = gerar_recomendacoes_espn_n3(jogos, agora_brt) + recomendacoes_verificadas(carregar_recomendacoes())
+    recomendacoes = recomendacoes_verificadas(recomendacoes)
+    print(f"[i] {len(eventos)} eventos · {len(br)} BR · {len(jogos)} hoje · {len(semana)} na semana · {len(recomendacoes)} value")
 
-    mensagem = montar_mensagem(jogos, agora_brt, proximo_jogo(br, agora_brt))
+    mensagem = montar_mensagem(
+        jogos, agora_brt, proximo_jogo(br, agora_brt), weekly_games=semana,
+        recomendacoes=recomendacoes,
+    )
 
     DATA_DIR.mkdir(exist_ok=True)
     snapshot = {
@@ -481,6 +851,11 @@ def main():
             }
             for ev in jogos
         ],
+        "jogos_semana": [
+            {"nome": ev["name"], "inicio_brt": ev["_start_brt"].isoformat(), "odds": extrair_odds(ev)}
+            for ev in semana
+        ],
+        "recomendacoes_verificadas": recomendacoes,
     }
     (DATA_DIR / f"snapshot_{agora_brt:%Y-%m-%d}.json").write_text(
         json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
