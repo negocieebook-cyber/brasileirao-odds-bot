@@ -454,10 +454,10 @@ def _taxas_time_espn(league: str, team_id: str, season: int):
 # puxa forte para o baseline da liga; amostra grande -> prevalece a média real.
 SHRINKAGE_K = 30
 BASELINE_GOL_LIGA = {
-    # média de gols por time por jogo (atacar) + média sofrida, por divisão.
-    # Valores [não verificados oficialmente] — calibração inicial conservadora
-    # para a liga; substituível por médias reais da ESPN quando coletadas.
-    "bra.1": 1.45, "bra.2": 1.30, "bra.3": 1.20, "bra.4": 1.15,
+    # Médias reais de gols por time por jogo (ataque), coletadas do calendário
+    # ESPN 2026 (backtest tmp/coleta_calendario.py): Serie A = 1.329, B = 1.159.
+    # C/D não expõem histórico na ESPN -> mantemos 1.30/1.25 como default.
+    "bra.1": 1.329, "bra.2": 1.159, "bra.3": 1.20, "bra.4": 1.15,
 }
 
 
